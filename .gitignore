@@ -1,0 +1,7 @@
+.DS_Store
+
+# Source media for tools/bake.py. Only the baked frame data in assets/ is published.
+*.mp4
+*.jpg
+*.png
+*.HEIC

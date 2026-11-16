@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chichi Eyes</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050506; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  /* corner readouts: same monospace as the figure, dim, shown after the reveal */
+  .meta {
+    position: fixed; margin: 0; padding: 20px 24px;
+    font: 11px/1.7 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: 0.08em; color: #5d626b; white-space: pre;
+    pointer-events: none; user-select: none;
+    font-variant-numeric: tabular-nums;
+    opacity: 0; transition: opacity 0.8s ease;
+  }
+  .ready .meta { opacity: 1; }
+  .meta b { font-weight: normal; color: #a9aeb7; }
+  .meta i { font-style: normal; color: #4a8cff; }
+  .meta a {
+    color: inherit; text-decoration: none; pointer-events: auto; cursor: pointer;
+    padding: 6px 0; transition: color 0.15s ease;
+  }
+  .meta a:hover { color: #a9aeb7; text-decoration: underline; text-underline-offset: 3px; }
+  .meta a:focus-visible { outline: 1px solid #4a8cff; outline-offset: 3px; }
+  #tl { top: 0; left: 0; }
+  #tr { top: 0; right: 0; text-align: right; }
+  #bl { bottom: 0; left: 0; }
+  #br { bottom: 0; right: 0; text-align: right; }
+  @media (max-width: 600px) { #bl { display: none; } }
+  @media (prefers-reduced-motion: reduce) { .meta { transition: none; } }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<pre class="meta" id="tl"><b>CHICHI</b>
+<a href="https://agent-chichi.ai/" target="_blank" rel="noopener">agent-chichi.ai</a></pre>
+<pre class="meta" id="tr"><i>●</i> <b id="state">STANDBY</b>
+<span id="time">00:00.00 / 00:00.00</span></pre>
+<pre class="meta" id="bl">LOOK  <span id="look">X +0.00  Y +0.00</span>
+GRID  <span id="grid">0×0</span>
+FPS   <span id="fps">0</span></pre>
+<pre class="meta" id="br"><b>CLICK</b>  hey chichi
+<b>TYPE</b>  typing
+<b>1-6</b>  clips</pre>
+<script type="module">
+// The Chichi clips drawn as ASCII. The clips are baked frame data in assets/, made from the
+// rendered videos by tools/bake.py. Each frame of the active clip is scaled to one pixel per
+// character cell.
+//
+// Controls
+//   pointer move  the head turns toward the pointer; the body stays still
+//   click / tap   "hey chichi" then "yes"
+//   typing        the laptop clip plays while keys are pressed
+//   1-6           play a clip directly (see CLIPS order)
+
+const RAMP = ' .,:;-=+*#%@';
+const CELL = 10;                 // character height in CSS px
+const SIDE = 0.2;                // extra grid width on each side of the clip, as a fraction of it
+const EMPTY = 0.14;              // below this brightness a cell stays empty (background, eyes)
+const REVEAL_MS = 1800, BAND = 6;
+// Head region in clip coordinates (0-1). The clips are pre-rendered, so the head turn is
+// a warp of this region. yaw and pitch stay below 0.5 so the warp never folds over.
+const HEAD = {
+  // the ellipse covers the face only; the ears and the earcup sit outside it and keep their shape
+  x: 0.48, y: 0.385, rx: 0.205, ry: 0.18,
+  yaw: 0.48, pitch: 0.36,
+  shiftX: 0.03, shiftY: 0.018,
+  neck: [0.47, 0.62],            // the whole-head shift fades out between these heights
+};
+const clamp01 = (n) => Math.min(1, Math.max(0, n));
+
+// ---------- clips ----------
+const CLIPS = {
+  'standby':     { loop: true },
+  'look-around': {},
+  'heychichi':   { next: 'yeeees' },
+  'yeeees':      {},
+  'listening':   {},
+  'typing':      { loop: true },
+};
+const NAMES = Object.keys(CLIPS);
+
+// The clips are baked frame data, not video (see tools/bake.py). A cell is one byte: the gray
+// levels come first, then the brightness levels of the headset blue. Each clip file is gzip
+// data, and a frame is stored as the difference from the frame before it.
+const clipCanvas = document.createElement('canvas');
+const clipCtx = clipCanvas.getContext('2d');
+let meta = null, clipImage = null, shown = null;
+const palette = new Uint32Array(256); // cell code to packed RGBA
+
+async function loadClip(name) {
+  const response = await fetch(`assets/${name}.bin`);
+  const stream = response.body.pipeThrough(new DecompressionStream('gzip'));
+  const data = new Uint8Array(await new Response(stream).arrayBuffer());
+  const cells = meta.width * meta.height;
+  for (let i = cells; i < data.length; i++) data[i] += data[i - cells]; // wraps modulo 256, as in the bake
+  CLIPS[name].data = data;
+  CLIPS[name].frames = data.length / cells;
+}
+
+async function loadClips() {
+  meta = await (await fetch('assets/clips.json')).json();
+  const { width, height, levels, white, blue } = meta;
+  clipCanvas.width = width;
+  clipCanvas.height = height;
+  clipImage = clipCtx.createImageData(width, height);
+  // the gray level is a luminance, so the fur tint is scaled to keep that luminance
+  const gain = 1 / (0.2126 * white[0] + 0.7152 * white[1] + 0.0722 * white[2]);
+  for (let code = 0; code < levels * 2; code++) {
+    const level = (code % levels) / (levels - 1) * 255;
+    const [r, g, b] = (code < levels ? white.map((c) => c * gain) : blue).map((c) => Math.min(255, c * level));
+    palette[code] = (255 << 24 | b << 16 | g << 8 | r) >>> 0; // little-endian RGBA
+  }
+  await loadClip('standby'); // the figure appears as soon as the first clip is there
+  play('standby');
+  await Promise.all(NAMES.filter((name) => name !== 'standby').map(loadClip));
+}
+
+let current = null, startedAt = 0;
+let lastInput = performance.now();
+function play(name) {
+  if (current === name || !CLIPS[name].data) return; // already on, or not loaded yet
+  current = name;
+  startedAt = performance.now();
+}
+
+// Draws the frame of the active clip for this moment into clipCanvas. A clip that is not a
+// loop hands over to its `next` clip, or to standby, when it ends.
+function drawClip(now) {
+  let clip = CLIPS[current];
+  let index = Math.floor((now - startedAt) / 1000 * meta.fps);
+  if (clip.loop) index %= clip.frames;
+  else if (index >= clip.frames) {
+    play(clip.next ?? 'standby');
+    index = CLIPS[current] === clip ? clip.frames - 1 : 0;
+    clip = CLIPS[current];
+  }
+  index = Math.max(0, index);
+  if (shown === current + index) return;
+  shown = current + index;
+  const cells = meta.width * meta.height;
+  const out = new Uint32Array(clipImage.data.buffer);
+  for (let i = 0, from = index * cells; i < cells; i++) out[i] = palette[clip.data[from + i]];
+  clipCtx.putImageData(clipImage, 0, 0);
+}
+loadClips();
+
+// ---------- canvases ----------
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const sample = document.createElement('canvas');
+const sctx = sample.getContext('2d', { willReadFrequently: true });
+let cols = 1, clipCols = 1, padCols = 0, rows = 1, size = 1;
+let pixels = new Uint8ClampedArray(4);
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  size = Math.min(w, h) * 0.95; // the clips are square
+  rows = Math.max(1, Math.round(size / CELL));
+  clipCols = Math.max(1, Math.round(size / (CELL * 0.6))); // monospace glyphs are about 0.6 wide
+  // The grid is wider than the clip, so a paw that reaches past the clip edge is not cut off.
+  padCols = Math.round(clipCols * SIDE);
+  cols = clipCols + 2 * padCols;
+  sample.width = cols;
+  sample.height = rows;
+  pixels = new Uint8ClampedArray(cols * rows * 4);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- input ----------
+// Look direction is measured from the head, not from the window center: the pointer on the
+// face means straight ahead, and the turn saturates a little over one head width away.
+const target = { x: 0, y: 0 };
+function onPointer(e) {
+  const w = window.innerWidth, h = window.innerHeight;
+  const headX = (w - size) / 2 + HEAD.x * size, headY = (h - size) / 2 + HEAD.y * size;
+  const reach = size * HEAD.rx * 2.2;
+  target.x = Math.min(1, Math.max(-1, (e.clientX - headX) / reach));
+  target.y = Math.min(1, Math.max(-1, -(e.clientY - headY) / reach));
+  lastInput = performance.now();
+}
+window.addEventListener('pointermove', onPointer);
+window.addEventListener('pointerdown', (e) => {
+  onPointer(e);
+  if (e.target.closest('a')) return; // the link opens a tab; it does not call Chichi
+  play('heychichi');
+  if (reducedMotion) return;
+  const now = performance.now();
+  const u = (e.clientX - (window.innerWidth - size) / 2) / size;
+  const v = (e.clientY - (window.innerHeight - size) / 2) / size;
+  // Within reach the paw lands on the click point and the burst waits for the hit.
+  // Out of reach the burst marks the point at once and the paw swats toward it.
+  const reached = startSwat(u, v, now);
+  bursts.push({ x: e.clientX, y: e.clientY, at: reached ? now + SWAT_MS * HIT : now, spin: Math.random() * Math.PI });
+  velY -= 5; // a quick nod at the click point
+});
+
+let typingTimer = 0;
+window.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  lastInput = performance.now();
+  const direct = NAMES[Number(e.key) - 1];
+  if (direct) { play(direct); return; }
+  if (e.key.length !== 1 && e.key !== 'Backspace' && e.key !== 'Enter') return;
+  play('typing');
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => { if (current === 'typing') play('standby'); }, 1500);
+});
+
+// With no input for a while, Chichi looks around or listens by itself.
+setInterval(() => {
+  if (current !== 'standby' || performance.now() - lastInput < 10000) return;
+  lastInput = performance.now();
+  play(Math.random() < 0.5 ? 'look-around' : 'listening');
+}, 1000);
+
+// ---------- loop ----------
+const STIFFNESS = 60, DAMPING = 11;
+let lookX = 0, lookY = 0, velX = 0, velY = 0;
+let revealAt = null;
+let last = performance.now();
+
+// ---------- paw swat ----------
+// The clips have no paw motion, so a click draws one front leg into the clip frame before the
+// head turn and the glyph pass. It goes through the same shading as the clip, so it reads as
+// the same fur. The body moves with the leg: it leans back while the paw lifts, then lunges
+// toward the click. All positions are clip coordinates (0-1).
+const PAWS = {
+  // The shoulders sit high at the sides of the chest, below the cheeks. The legs do not start
+  // from the middle of the chest.
+  left:  { shoulder: [0.345, 0.555], rest: [0.42, 0.815], out: -1 },
+  right: { shoulder: [0.635, 0.555], rest: [0.555, 0.815], out: 1 },
+};
+const SWAT_MS = 760;
+const LIFT = 0.24, HIT = 0.42, HOLD = 0.62;   // phase ends, as fractions of the swat
+const SWAT_REACH = 0.27;
+const ARM_R = [0.086, 0.07], PAW_R = 0.08;    // leg radius at the shoulder and at the wrist
+const FOOT = 0.86, TALL = 0.7;                // the lean pivots on the feet and grows up the body
+const LEAN_X = 0.06, LEAN_Y = 0.045;          // sideways lean at the head, height change
+const ARM_STEPS = 10;
+const ELBOW_Y = 0.64, SHADE = 0.4;                // resting elbow height, shadow width in leg radii
+let swat = null;
+const ease = (t) => t * t * (3 - 2 * t);
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+
+// Shared timeline: -0.3 at the top of the lift (anticipation), 1 on the hit, 0 at rest.
+function swatDrive(t) {
+  if (t < LIFT) return -0.3 * ease(t / LIFT);
+  if (t < HIT) return -0.3 + 1.3 * ((t - LIFT) / (HIT - LIFT)) ** 2;
+  if (t < HOLD) return 1;
+  return 1 - ease((t - HOLD) / (1 - HOLD));
+}
+
+// lift, strike, hold, return
+function pawAt(s, now) {
+  const t = (now - s.at) / SWAT_MS;
+  if (t < LIFT) return mix(s.from, s.up, ease(t / LIFT));
+  if (t < HIT) return mix(s.up, s.to, ((t - LIFT) / (HIT - LIFT)) ** 2);
+  if (t < HOLD) return s.to;
+  return mix(s.to, PAWS[s.side].rest, ease(clamp01((t - HOLD) / (1 - HOLD))));
+}
+
+function startSwat(u, v, now) {
+  const side = u < 0.49 ? 'left' : 'right';
+  const [sx, sy] = PAWS[side].shoulder;
+  const far = Math.hypot(u - sx, v - sy) || 1;
+  const dir = [(u - sx) / far, (v - sy) / far];
+  // The body lean moves the paw too. Take the lean at the hit out of the target, so the paw
+  // lands on the click point.
+  const stretch = -dir[1] * LEAN_Y;
+  const tv = v < FOOT ? FOOT - (FOOT - v) / (1 + stretch) : v;
+  const tu = u - dir[0] * LEAN_X * clamp01((FOOT - tv) / TALL);
+  const reach = Math.hypot(tu - sx, tv - sy) || 1;
+  const length = Math.min(SWAT_REACH, Math.max(0.12, reach));
+  const to = [sx + (tu - sx) / reach * length, sy + (tv - sy) / reach * length];
+  // a second click on the same side starts from where the paw is now
+  const from = swat?.side === side && now - swat.at < SWAT_MS ? pawAt(swat, now) : PAWS[side].rest;
+  swat = { side, at: now, from, to, dir, moved: from === PAWS[side].rest ? 0 : 1, up: [sx + PAWS[side].out * 0.02 - dir[0] * 0.04, sy + 0.07] };
+  return reach <= SWAT_REACH;
+}
+
+// Draws the leg into `buf` and returns the body lean for this frame: [sideways, height change].
+function drawSwat(buf, now) {
+  if (!swat) return [0, 0];
+  const t = (now - swat.at) / SWAT_MS;
+  if (t >= 1) { swat = null; return [0, 0]; }
+  const { shoulder: [sx, sy], rest: [rx, ry], out } = PAWS[swat.side];
+  const [px, py] = pawAt(swat, now);
+  const drive = swatDrive(t);
+  // the paw flattens on the hit and recovers during the hold
+  const pr = PAW_R * (t >= HIT && t < HOLD ? 1.25 - 0.25 * (t - HIT) / (HOLD - HIT) : 1);
+
+  // The leg is a curve with the elbow pushed down and outward. The bend is strong while the
+  // paw is in the air and almost gone on the hit. At rest the leg is straight, like the clip.
+  const ax = px - sx, ay = py - sy;
+  const len = Math.hypot(ax, ay) || 1e-6;
+  let ex = -ay / len, ey = ax / len;
+  if (ex * out * 0.6 + ey < 0) { ex = -ex; ey = -ey; }
+  const air = t < LIFT ? 1 : t < HIT ? 1 - 0.85 * ((t - LIFT) / (HIT - LIFT)) ** 2 : 0.15;
+  const bend = 0.32 * air * len;
+  // At rest the elbow sits on the chest above the paw, so the lower leg lies on the leg of the
+  // clip. `moved` takes the elbow from there to its place in the swat and back.
+  const moved = t < LIFT ? Math.max(swat.moved, ease(t / LIFT)) : t < HOLD ? 1 : 1 - ease((t - HOLD) / (1 - HOLD));
+  const kx = rx + ((sx + px) / 2 + ex * bend - rx) * moved;
+  const ky = ELBOW_Y + ((sy + py) / 2 + ey * bend - ELBOW_Y) * moved;
+  // The leg fades in over the leg of the clip at the start and out at the end.
+  const fade = Math.min(1, t / 0.1, (1 - t) / 0.12);
+  // fur color of the clip at the resting leg, so the leg matches the light on its side
+  const at = (Math.min(rows - 1, (ry - 0.04) * rows | 0) * cols + ((rx * clipCols | 0) + padCols)) * 4;
+  const fur = buf[at] > 120 ? [buf[at], buf[at + 1], buf[at + 2]] : [238, 238, 232];
+  const xs = [], ys = [];
+  for (let j = 0; j <= ARM_STEPS; j++) {
+    const q = j / ARM_STEPS, p = 1 - q;
+    xs.push(p * p * sx + 2 * p * q * kx + q * q * px);
+    ys.push(p * p * sy + 2 * p * q * ky + q * q * py);
+  }
+  // paw axis, for the toe lines
+  const tx = px - kx, ty = py - ky, tl = Math.hypot(tx, ty) || 1e-6;
+
+  const pad = 0.15;
+  const c0 = Math.max(0, Math.floor((Math.min(sx, px, kx, rx) - pad) * clipCols) + padCols);
+  const c1 = Math.min(cols - 1, Math.ceil((Math.max(sx, px, kx, rx) + pad) * clipCols) + padCols);
+  const r0 = Math.max(0, Math.floor((Math.min(sy, py, ky) - pad) * rows));
+  const r1 = Math.min(rows - 1, Math.ceil((Math.max(sy, py, ky, ry) + pad) * rows));
+  for (let r = r0; r <= r1; r++) {
+    const v = (r + 0.5) / rows;
+    for (let c = c0; c <= c1; c++) {
+      const u = (c + 0.5 - padCols) / clipCols;
+      const i = (r * cols + c) * 4;
+      // remove the resting paw of the clip where it shows below the body
+      if (v > 0.8 && ((u - rx) / 0.072) ** 2 + ((v - ry - 0.015) / 0.05) ** 2 < 1) {
+        for (let k = 0; k < 3; k++) buf[i + k] *= 1 - fade;
+      }
+      // nearest point on the leg curve: distance in leg radii, position along the leg
+      let dArm = Infinity, along = 0, ox = 0, oy = 0;
+      for (let j = 0; j < ARM_STEPS; j++) {
+        const bx = xs[j + 1] - xs[j], by = ys[j + 1] - ys[j];
+        const qx = u - xs[j], qy = v - ys[j];
+        const h = clamp01((qx * bx + qy * by) / (bx * bx + by * by || 1e-6));
+        const at = (j + h) / ARM_STEPS;
+        const d = Math.hypot(qx - bx * h, qy - by * h) / (ARM_R[0] + (ARM_R[1] - ARM_R[0]) * at);
+        if (d < dArm) { dArm = d; along = at; ox = qx - bx * h; oy = qy - by * h; }
+      }
+      const dPaw = Math.hypot(u - px, v - py) / pr;
+      const d = Math.min(dArm, dPaw);
+      if (d >= 1 + SHADE) continue;
+      // the leg fades into the body at the shoulder, so no round cap shows there
+      const joint = dPaw < 1 ? 1 : clamp01(along / 0.3);
+      if (d >= 1) {
+        // a soft shadow around the leg separates it from the body; there is no dark outline
+        const dim = 1 - 0.22 * (1 - (d - 1) / SHADE) * joint * fade;
+        for (let k = 0; k < 3; k++) buf[i + k] *= dim;
+        continue;
+      }
+      let lum = 0.88 + 0.12 * Math.min(1, (1 - d) * 2.5);
+      // the light comes from the upper left, as in the clips
+      const lit = dPaw < dArm ? ((v - py) + (u - px) * 0.5) / pr : (oy + ox * 0.5) / ARM_R[0];
+      lum *= 1 - 0.06 * lit;
+      if (dPaw < 1) {
+        // two short toe lines at the far end of the paw
+        const front = ((u - px) * tx + (v - py) * ty) / tl / pr;
+        const across = ((v - py) * tx - (u - px) * ty) / tl / pr;
+        if (front > 0.3 && Math.abs(Math.abs(across) - 0.33) < 0.1) lum *= 0.82;
+      }
+      // the edge is soft, like the fur edge of the clip
+      const alpha = clamp01((1 - d) / 0.2) * joint * fade;
+      for (let k = 0; k < 3; k++) buf[i + k] += (Math.min(255, fur[k] * lum) - buf[i + k]) * alpha;
+    }
+  }
+  return [swat.dir[0] * LEAN_X * drive, -swat.dir[1] * LEAN_Y * drive];
+}
+
+// ---------- click burst ----------
+// A ring of glyphs grows from the click point with a few sparks ahead of it. The glyphs sit
+// on the same character lattice as the figure, so the burst reads as part of the same screen.
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const BURST_MS = 650, BURST_R = 9, SPARKS = 9; // radius in character heights
+const bursts = [];
+function drawBursts(now) {
+  if (!bursts.length) return;
+  const w = window.innerWidth, h = window.innerHeight;
+  const cw = size / clipCols, ch = size / rows;
+  const ox = (w - size) / 2, oy = (h - size) / 2;
+  ctx.font = `bold ${ch}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.textBaseline = 'top';
+  const put = (c, r, glyph, color) => {
+    ctx.fillStyle = '#050506';
+    ctx.fillRect(ox + c * cw, oy + r * ch, cw, ch); // clear the figure glyph under the burst
+    ctx.fillStyle = color;
+    ctx.fillText(glyph, ox + c * cw, oy + r * ch);
+  };
+  for (let b = bursts.length - 1; b >= 0; b--) {
+    const { x, y, at, spin } = bursts[b];
+    const a = (now - at) / BURST_MS;
+    if (a < 0) continue; // waits for the paw
+    if (a >= 1) { bursts.splice(b, 1); continue; }
+    const out = 1 - (1 - a) * (1 - a) * (1 - a);        // fast start, slow end
+    const radius = BURST_R * ch * out;
+    const width = ch * (1.3 - 0.8 * a);                 // the ring gets thinner as it grows
+    // white at the start, headset blue at the end
+    const color = `rgb(${255 - 181 * a | 0},${255 - 115 * a | 0},255)`;
+    const c0 = Math.floor((x - ox) / cw), r0 = Math.floor((y - oy) / ch);
+    const reachC = Math.ceil((radius + width) / cw), reachR = Math.ceil((radius + width) / ch);
+    for (let r = r0 - reachR; r <= r0 + reachR; r++) {
+      for (let c = c0 - reachC; c <= c0 + reachC; c++) {
+        const d = Math.hypot(ox + (c + 0.5) * cw - x, oy + (r + 0.5) * ch - y);
+        const edge = 1 - Math.abs(d - radius) / width; // 1 on the ring, 0 at its border
+        const core = a < 0.2 && d < ch * 1.6;          // short flash at the click point
+        if (!core && (edge <= 0 || Math.random() < a * a)) continue; // the ring breaks up as it fades
+        put(c, r, core ? '@' : RAMP[Math.max(1, edge * (1 - a * 0.6) * RAMP.length | 0)], core ? '#fff' : color);
+      }
+    }
+    if (a < 0.8) {
+      for (let s = 0; s < SPARKS; s++) {
+        const angle = spin + s / SPARKS * Math.PI * 2;
+        const far = radius * (1.25 + 0.2 * (s % 3)) + ch;
+        const c = Math.floor((x + Math.cos(angle) * far - ox) / cw);
+        const r = Math.floor((y + Math.sin(angle) * far - oy) / ch);
+        put(c, r, a < 0.3 ? '*' : a < 0.55 ? '+' : '.', color);
+      }
+    }
+  }
+}
+
+// ---------- corner readouts ----------
+const hud = Object.fromEntries(['state', 'time', 'look', 'grid', 'fps'].map((id) => [id, document.getElementById(id)]));
+const signed = (n) => (n < 0 ? '-' : '+') + Math.abs(n).toFixed(2);
+const clock = (s) => {
+  s = Number.isFinite(s) ? s : 0;
+  return `${String(s / 60 | 0).padStart(2, '0')}:${(s % 60).toFixed(2).padStart(5, '0')}`;
+};
+let fps = 60, hudAt = 0;
+function updateHud(now, dt) {
+  if (dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (revealAt !== null && now - revealAt >= REVEAL_MS) document.body.classList.add('ready');
+  if (now - hudAt < 100) return; // ten updates per second keep the digits readable
+  hudAt = now;
+  if (!current) return;
+  const length = CLIPS[current].frames / meta.fps;
+  hud.state.textContent = current.toUpperCase();
+  hud.time.textContent = `${clock(Math.max(0, now - startedAt) / 1000 % length)} / ${clock(length)}`;
+  hud.look.textContent = `X ${signed(lookX)}  Y ${signed(lookY)}`;
+  hud.grid.textContent = `${cols}×${rows}`;
+  hud.fps.textContent = Math.round(fps);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  // slightly underdamped spring toward the pointer
+  velX += ((target.x - lookX) * STIFFNESS - velX * DAMPING) * dt;
+  velY += ((target.y - lookY) * STIFFNESS - velY * DAMPING) * dt;
+  lookX += velX * dt;
+  lookY += velY * dt;
+  updateHud(now, dt);
+
+  const w = window.innerWidth, h = window.innerHeight;
+  ctx.setTransform(canvas.width / w, 0, 0, canvas.height / h, 0, 0);
+  ctx.fillStyle = '#050506';
+  ctx.fillRect(0, 0, w, h);
+
+  if (!current) return; // the first clip is still loading
+  drawClip(now);
+
+  // Draw the clip one pixel per cell, then turn the head. The body is left untouched.
+  // Inside the head ellipse the image slides over a dome: most at the center, nothing at the
+  // rim, so the face turns while the silhouette holds. The head also shifts a little as a
+  // whole, fading out through the neck.
+  sctx.fillStyle = '#000';
+  sctx.fillRect(0, 0, cols, rows);
+  sctx.drawImage(clipCanvas, padCols, 0, clipCols, rows);
+  const source = sctx.getImageData(0, 0, cols, rows).data;
+  const [leanX, stretch] = drawSwat(source, now);
+  const yaw = lookX * HEAD.yaw, pitch = lookY * HEAD.pitch;
+  for (let r = 0; r < rows; r++) {
+    // body lean of the swat: the height changes from the feet up, and the figure shears sideways
+    let v0 = (r + 0.5) / rows;
+    if (v0 < FOOT) v0 = FOOT - (FOOT - v0) / (1 + stretch);
+    const lean = leanX * clamp01((FOOT - v0) / TALL);
+    const neck = clamp01((v0 - HEAD.neck[0]) / (HEAD.neck[1] - HEAD.neck[0]));
+    const whole = 1 - neck * neck * (3 - 2 * neck);
+    for (let c = 0; c < cols; c++) {
+      let u = (c + 0.5 - padCols) / clipCols - lean - lookX * HEAD.shiftX * whole;
+      let v = v0 + lookY * HEAD.shiftY * whole;
+      const nx = (u - HEAD.x) / HEAD.rx, ny = (v - HEAD.y) / HEAD.ry;
+      const dome = 1 - nx * nx - ny * ny;
+      if (dome > 0) {
+        u -= HEAD.rx * yaw * dome;
+        v += HEAD.ry * pitch * dome;
+      }
+      const sc = Math.min(cols - 1, Math.max(0, Math.floor(u * clipCols) + padCols));
+      const sr = Math.min(rows - 1, Math.max(0, v * rows | 0));
+      const from = (sr * cols + sc) * 4, to = (r * cols + c) * 4;
+      pixels[to] = source[from];
+      pixels[to + 1] = source[from + 1];
+      pixels[to + 2] = source[from + 2];
+    }
+  }
+
+
+  // blend in the strongest channel so the blue headset does not read as shadow
+  const lumAt = (i) => Math.max(
+    0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2],
+    0.7 * Math.max(pixels[i], pixels[i + 1], pixels[i + 2])) / 255;
+
+  // Wipe reveal on load: the figure fills in from its bottom row to its top row.
+  // `front` is the row where the fill has arrived; the BAND rows above it flicker with random glyphs.
+  let front = -Infinity;
+  if (revealAt === null || now - revealAt < REVEAL_MS) {
+    let top = rows, bottom = -1;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (lumAt((r * cols + c) * 4) >= EMPTY) { top = Math.min(top, r); bottom = r; break; }
+      }
+    }
+    if (bottom < 0) return;
+    revealAt ??= now;
+    const t = (now - revealAt) / REVEAL_MS;
+    const p = t * t * (3 - 2 * t);
+    front = bottom + 1 - p * (bottom - top + 1 + BAND);
+  }
+
+  const cw = size / clipCols, ch = size / rows;
+  const ox = (w - size) / 2 - padCols * cw, oy = (h - size) / 2;
+  ctx.font = `bold ${ch}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.textBaseline = 'top';
+  for (let r = Math.max(0, Math.ceil(front)); r < rows; r++) {
+    const settle = (r - front) / BAND; // 0 at the leading edge, 1 and above once settled
+    for (let c = 0; c < cols; c++) {
+      const i = (r * cols + c) * 4;
+      const lum = lumAt(i);
+      if (lum < EMPTY) continue;
+      if (settle < 1) {
+        if (Math.random() > settle) continue; // sparse at the edge, dense toward the settled rows
+        ctx.fillStyle = '#fff';
+        ctx.fillText(RAMP[1 + Math.random() * (RAMP.length - 1) | 0], ox + c * cw, oy + r * ch);
+        continue;
+      }
+      // The fur is almost uniformly bright; the power curve spreads it across the ramp.
+      // Saturated cells (the headset) skip the curve so they stay dense.
+      const max = Math.max(pixels[i], pixels[i + 1], pixels[i + 2]);
+      const sat = (max - Math.min(pixels[i], pixels[i + 1], pixels[i + 2])) / max;
+      const shade = Math.pow(lum, 2.4) * (1 - sat) + (max / 255) * sat;
+      const s = Math.min(255 / max, 1.6);
+      ctx.fillStyle = `rgb(${pixels[i] * s | 0},${pixels[i + 1] * s | 0},${pixels[i + 2] * s | 0})`;
+      ctx.fillText(RAMP[Math.min(RAMP.length - 1, 1 + shade * (RAMP.length - 1) | 0)], ox + c * cw, oy + r * ch);
+    }
+  }
+  drawBursts(now);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
