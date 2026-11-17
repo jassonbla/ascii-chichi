@@ -4,6 +4,8 @@ Chichi, the symbol character of [agent-chichi.ai](https://agent-chichi.ai/), dra
 
 One HTML file, no dependencies, no build step.
 
+Live page: <https://ascii-chichi.vercel.app/>
+
 ## Run
 
 The page loads its clip data with `fetch`, so it needs a web server. Opening `index.html` from the file system does not work.
