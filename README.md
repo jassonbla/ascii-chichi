@@ -2,6 +2,8 @@
 
 Chichi, the symbol character of [agent-chichi.ai](https://agent-chichi.ai/), drawn as live ASCII art in the browser. The head follows the pointer, and a click makes Chichi swat at the click point.
 
+https://github.com/user-attachments/assets/524553e9-d501-4062-a99e-273241003157
+
 One HTML file, no dependencies, no build step.
 
 Live page: <https://ascii-chichi.vercel.app/>
